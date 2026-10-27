@@ -7,6 +7,7 @@ import path from "node:path";
 import { Readable } from "node:stream";
 import { pipeline } from "node:stream/promises";
 import { spawnSync } from "node:child_process";
+import dgram from "node:dgram";
 import { Client } from "discord.js-selfbot-v13";
 import { Streamer, prepareStream, playStream } from "@dank074/discord-video-stream";
 
@@ -23,6 +24,7 @@ const MAX_MEDIA_MB = Number(process.env.MAX_MEDIA_MB || 150);
 const VIDEOS = (process.env.VIDEOS || "").split(",").map((v) => v.trim()).filter(Boolean);
 
 // Impostazioni stream (modificabili senza toccare il codice)
+const JOIN_TIMEOUT_SEC = Number(process.env.JOIN_TIMEOUT_SEC || 45);
 const STREAM_TYPE = (process.env.STREAM_TYPE || "camera").toLowerCase(); // camera | go-live
 const VIDEO_CODEC = (process.env.VIDEO_CODEC || "H264").toUpperCase(); // H264 | VP8
 const STREAM_WIDTH = Number(process.env.STREAM_WIDTH || 1280);
@@ -296,26 +298,62 @@ function scheduleStatus() {
   setTimeout(scheduleStatus, base + jitter(0, 2 * MIN));
 }
 
+// --- Test UDP: Discord voice richiede UDP in uscita E in risposta ---
+function udpCheck(host = "stun.l.google.com", port = 19302, timeoutMs = 4000) {
+  return new Promise((resolve) => {
+    const sock = dgram.createSocket("udp4");
+    const tid = Buffer.from(Array.from({ length: 12 }, () => Math.floor(Math.random() * 256)));
+    const req = Buffer.alloc(20);
+    req.writeUInt16BE(0x0001, 0); // Binding Request
+    req.writeUInt16BE(0, 2);
+    req.writeUInt32BE(0x2112a442, 4);
+    tid.copy(req, 8);
+    const done = (r) => { try { sock.close(); } catch {} resolve(r); };
+    const timer = setTimeout(() => done({ ok: false, reason: "nessuna risposta (UDP bloccato o filtrato)" }), timeoutMs);
+    sock.on("error", (e) => { clearTimeout(timer); done({ ok: false, reason: e.message }); });
+    sock.on("message", (msg) => {
+      clearTimeout(timer);
+      let ip = "?";
+      // cerca XOR-MAPPED-ADDRESS (0x0020)
+      for (let o = 20; o + 4 <= msg.length; ) {
+        const type = msg.readUInt16BE(o), len = msg.readUInt16BE(o + 2);
+        if (type === 0x0020 && len >= 8) {
+          const m = msg.readUInt32BE(4);
+          const a = msg.readUInt32BE(o + 8) ^ m;
+          ip = [a >>> 24, (a >>> 16) & 255, (a >>> 8) & 255, a & 255].join(".");
+        }
+        o += 4 + len + ((4 - (len % 4)) % 4);
+      }
+      done({ ok: true, ip });
+    });
+    sock.send(req, port, host, (err) => { if (err) { clearTimeout(timer); done({ ok: false, reason: err.message }); } });
+  });
+}
+
+async function joinVC() {
+  for (let a = 1; ; a++) {
+    try {
+      console.log(`joinVoice (tentativo ${a}) guild=${GUILD_ID} channel=${CHANNEL_ID}`);
+      await withTimeout(streamer.joinVoice(GUILD_ID, CHANNEL_ID), JOIN_TIMEOUT_SEC * 1000, "joinVoice");
+      return;
+    } catch (e) {
+      console.error(`Join VC fallito (tentativo ${a}):`, e?.message || e);
+      if (/timeout/i.test(e?.message || "")) {
+        console.warn("joinVoice non risolto ma l'account è nel canale: provo comunque a trasmettere");
+        return;
+      }
+      if (a >= 4) throw e;
+      await sleep(5000 * a + jitter(0, 3000));
+    }
+  }
+}
+
 // --- Un turno: entra, trasmette i video in loop fino a fine turno, esce ---
 async function runSession(end) {
   let failures = 0;
   let emptyLogged = false;
   try {
-    for (let a = 1; ; a++) {
-      try {
-        console.log(`joinVoice (tentativo ${a}) guild=${GUILD_ID} channel=${CHANNEL_ID}`);
-        await withTimeout(streamer.joinVoice(GUILD_ID, CHANNEL_ID), 30_000, "joinVoice");
-        break;
-      } catch (e) {
-        console.error(`Join VC fallito (tentativo ${a}):`, e?.message || e);
-        if (/timeout/i.test(e?.message || "")) {
-          console.warn("joinVoice non risolto ma l'account è nel canale: provo comunque a trasmettere");
-          break;
-        }
-        if (a >= 4) throw e;
-        await sleep(5000 * a + jitter(0, 3000));
-      }
-    }
+    await joinVC();
     console.log(`Entrato nel VC, resto fino alle ${fmt(end)}`);
 
     while (!stopping && Date.now() < end - 5000) {
@@ -356,8 +394,13 @@ async function runSession(end) {
         failures++;
         console.error(`Errore stream (#${failures}):`, err?.message || err);
         if (failures >= 8) {
-          console.error("Troppi errori consecutivi, mi fermo. Controlla token/account.");
-          process.exit(1);
+          throw new Error("Troppi errori consecutivi: chiudo questo turno e riprovo al prossimo");
+        }
+        if (/WebRTC|not ready/i.test(err?.message || "")) {
+          // connessione media non pronta: esco e rientro nel canale
+          try { streamer.leaveVoice(); } catch {}
+          await sleep(3000);
+          try { await joinVC(); } catch (e) { console.error("Rientro fallito:", e?.message || e); }
         }
         await sleep(Math.min(10_000 * 2 ** (failures - 1), 300_000) + jitter(0, 5000));
       } finally {
@@ -427,6 +470,12 @@ client.on("ready", async () => {
   } catch (e) {
     console.error("Playlist non caricata:", e?.message || e, "→ controlla MEDIA_CHANNEL_ID e che l'account veda il canale");
   }
+  const udp = await udpCheck();
+  console.log(
+    udp.ok
+      ? `[udp] OK: il container riceve risposte UDP (IP pubblico ${udp.ip})`
+      : `[udp] PROBLEMA: ${udp.reason} → Discord voice/video non può funzionare da qui`
+  );
   scheduleStatus();
   scheduler();
 });
