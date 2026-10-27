@@ -20,6 +20,8 @@ const SESSION_MINUTES = Number(process.env.SESSION_MINUTES || 90);
 const MIN_GAP_MINUTES = Number(process.env.MIN_GAP_MINUTES || 30);
 const TIMEZONE = process.env.TIMEZONE || "Europe/Rome";
 const SCHEDULE_SEED = process.env.SCHEDULE_SEED || "seed";
+// Se true, a ogni deploy/avvio entra subito e fa un turno completo
+const START_ON_DEPLOY = (process.env.START_ON_DEPLOY || "true").toLowerCase() !== "false";
 
 if (!TOKEN || !GUILD_ID || !CHANNEL_ID) {
   console.error("Mancano TOKEN, GUILD_ID o CHANNEL_ID");
@@ -89,11 +91,11 @@ function scheduleForDay(key, n, durMin, gapMin, tz, seed) {
     return { start: s, end: s + dur };
   });
 }
-function nextSession(now) {
+function nextSession(now, mustStartAfter = 0) {
   for (let d = 0; d < 3; d++) {
     const key = dayKeyOf(now + d * DAY, TIMEZONE);
     const list = scheduleForDay(key, SESSIONS_PER_DAY, SESSION_MINUTES, MIN_GAP_MINUTES, TIMEZONE, SCHEDULE_SEED);
-    const s = list.find((x) => x.end > now + 2 * MIN);
+    const s = list.find((x) => x.end > now + 2 * MIN && x.start >= mustStartAfter);
     if (s) return s;
   }
   return null;
@@ -127,7 +129,16 @@ let videoIndex = 0;
 async function runSession(end) {
   let failures = 0;
   try {
-    await streamer.joinVoice(GUILD_ID, CHANNEL_ID);
+    for (let a = 1; ; a++) {
+      try {
+        await streamer.joinVoice(GUILD_ID, CHANNEL_ID);
+        break;
+      } catch (e) {
+        console.error(`Join VC fallito (tentativo ${a}):`, e?.message || e);
+        if (a >= 4) throw e;
+        await sleep(5000 * a + jitter(0, 3000));
+      }
+    }
     console.log(`Entrato nel VC, resto fino alle ${fmt(end)}`);
 
     while (!stopping && Date.now() < end - 5000) {
@@ -169,9 +180,18 @@ async function runSession(end) {
 
 // --- Scheduler ---
 async function scheduler() {
+  let mustStartAfter = 0;
+
+  if (START_ON_DEPLOY) {
+    const end = Date.now() + SESSION_MINUTES * MIN;
+    console.log("Avvio: entro subito e inizio il turno");
+    mustStartAfter = end; // i turni programmati già iniziati vengono saltati
+    await runSession(end);
+  }
+
   while (!stopping) {
     const now = Date.now();
-    const s = nextSession(now);
+    const s = nextSession(now, mustStartAfter);
     if (!s) { await sleep(10 * MIN); continue; }
 
     if (s.start > now) {

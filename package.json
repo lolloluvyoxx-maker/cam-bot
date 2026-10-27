@@ -7,7 +7,7 @@
     "start": "node index.js"
   },
   "engines": {
-    "node": ">=18"
+    "node": "22.x"
   },
   "dependencies": {
     "@dank074/discord-video-stream": "^5.0.0",
