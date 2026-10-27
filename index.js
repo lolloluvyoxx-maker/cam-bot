@@ -22,6 +22,14 @@ const MAX_MEDIA_MB = Number(process.env.MAX_MEDIA_MB || 150);
 // Fallback opzionale: link/percorsi separati da virgola
 const VIDEOS = (process.env.VIDEOS || "").split(",").map((v) => v.trim()).filter(Boolean);
 
+// Impostazioni stream (modificabili senza toccare il codice)
+const STREAM_TYPE = (process.env.STREAM_TYPE || "camera").toLowerCase(); // camera | go-live
+const VIDEO_CODEC = (process.env.VIDEO_CODEC || "H264").toUpperCase(); // H264 | VP8
+const STREAM_WIDTH = Number(process.env.STREAM_WIDTH || 1280);
+const STREAM_HEIGHT = Number(process.env.STREAM_HEIGHT || 720);
+const STREAM_FPS = Number(process.env.STREAM_FPS || 30);
+const STREAM_BITRATE = Number(process.env.STREAM_BITRATE || 2500); // kbps
+
 const STATUSES = (process.env.STATUSES || "chill").split("|").map((s) => s.trim()).filter(Boolean);
 const STATUS_TYPE = process.env.STATUS_TYPE || "PLAYING";
 const STATUS_INTERVAL_MIN = Number(process.env.STATUS_INTERVAL_MIN || 15);
@@ -325,10 +333,10 @@ async function runSession(end) {
         preflight(next.src);
 
         const { command, output } = prepareStream(next.src, {
-          width: 1280, height: 720, frameRate: 30,
-          bitrateVideo: 2500, bitrateVideoMax: 3000,
-          bitrateKbps: 2500, maxBitrateKbps: 3000,
-          videoCodec: "H264", includeAudio: false,
+          width: STREAM_WIDTH, height: STREAM_HEIGHT, frameRate: STREAM_FPS,
+          bitrateVideo: STREAM_BITRATE, bitrateVideoMax: Math.round(STREAM_BITRATE * 1.2),
+          bitrateKbps: STREAM_BITRATE, maxBitrateKbps: Math.round(STREAM_BITRATE * 1.2),
+          videoCodec: VIDEO_CODEC, includeAudio: false,
         });
         command.on("start", (cmd) => console.log("ffmpeg avviato:", cmd.slice(0, 300)));
         command.on("stderr", (line) => {
@@ -339,8 +347,8 @@ async function runSession(end) {
         command.on("error", (err) => console.error("ffmpeg:", err?.message));
         killer = setTimeout(() => { try { command.kill("SIGKILL"); } catch {} }, Math.max(0, end - Date.now()));
 
-        console.log("playStream in corso...");
-        await playStream(output, streamer, { type: "camera" }); // o "go-live"
+        console.log(`playStream in corso... tipo=${STREAM_TYPE} codec=${VIDEO_CODEC} ${STREAM_WIDTH}x${STREAM_HEIGHT}@${STREAM_FPS} ${STREAM_BITRATE}kbps`);
+        await playStream(output, streamer, { type: STREAM_TYPE });
         console.log("playStream terminato");
         failures = 0;
       } catch (err) {
