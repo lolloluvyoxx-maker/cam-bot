@@ -2,6 +2,10 @@ import ffmpegPath from "ffmpeg-static";
 process.env.FFMPEG_PATH = ffmpegPath;
 
 import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
+import { Readable } from "node:stream";
+import { pipeline } from "node:stream/promises";
 import { spawnSync } from "node:child_process";
 import { Client } from "discord.js-selfbot-v13";
 import { Streamer, prepareStream, playStream } from "@dank074/discord-video-stream";
@@ -9,8 +13,14 @@ import { Streamer, prepareStream, playStream } from "@dank074/discord-video-stre
 // --- Config (variabili Railway) ---
 const TOKEN = process.env.TOKEN;
 const GUILD_ID = process.env.GUILD_ID;
-const CHANNEL_ID = process.env.CHANNEL_ID;
-const VIDEOS = (process.env.VIDEOS || "./video.mp4").split(",").map((v) => v.trim());
+const CHANNEL_ID = process.env.CHANNEL_ID; // canale vocale
+
+// Canale testuale da cui leggere i video (allegati)
+const MEDIA_CHANNEL_ID = process.env.MEDIA_CHANNEL_ID || "";
+const MEDIA_LIMIT = Number(process.env.MEDIA_LIMIT || 10); // quanti video recenti tenere
+const MAX_MEDIA_MB = Number(process.env.MAX_MEDIA_MB || 150);
+// Fallback opzionale: link/percorsi separati da virgola
+const VIDEOS = (process.env.VIDEOS || "").split(",").map((v) => v.trim()).filter(Boolean);
 
 const STATUSES = (process.env.STATUSES || "chill").split("|").map((s) => s.trim()).filter(Boolean);
 const STATUS_TYPE = process.env.STATUS_TYPE || "PLAYING";
@@ -22,11 +32,14 @@ const SESSION_MINUTES = Number(process.env.SESSION_MINUTES || 90);
 const MIN_GAP_MINUTES = Number(process.env.MIN_GAP_MINUTES || 30);
 const TIMEZONE = process.env.TIMEZONE || "Europe/Rome";
 const SCHEDULE_SEED = process.env.SCHEDULE_SEED || "seed";
-// Se true, a ogni deploy/avvio entra subito e fa un turno completo
 const START_ON_DEPLOY = (process.env.START_ON_DEPLOY || "true").toLowerCase() !== "false";
 
 if (!TOKEN || !GUILD_ID || !CHANNEL_ID) {
   console.error("Mancano TOKEN, GUILD_ID o CHANNEL_ID");
+  process.exit(1);
+}
+if (!MEDIA_CHANNEL_ID && VIDEOS.length === 0) {
+  console.error("Imposta MEDIA_CHANNEL_ID (canale con i video) oppure VIDEOS");
   process.exit(1);
 }
 
@@ -86,7 +99,6 @@ function rng(seed) { // mulberry32
     return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
   };
 }
-// Turni casuali ma stabili per quel giorno (un riavvio non cambia gli orari)
 function scheduleForDay(key, n, durMin, gapMin, tz, seed) {
   const start = localMidnight(key, tz);
   const rand = rng(hashStr(`${seed}:${key}`));
@@ -110,6 +122,121 @@ function nextSession(now, mustStartAfter = 0) {
 // END-SCHED
 
 const fmt = (ts) => new Date(ts).toLocaleString("it-IT", { timeZone: TIMEZONE });
+
+// BEGIN-DL
+const MEDIA_DIR = path.join(os.tmpdir(), "media");
+fs.mkdirSync(MEDIA_DIR, { recursive: true });
+
+const isVideo = (att) =>
+  (att.contentType || "").startsWith("video/") || /\.(mp4|mov|webm|mkv|m4v)$/i.test(att.name || "");
+
+async function downloadTo(url, dest, maxBytes) {
+  const res = await fetch(url, { headers: { "User-Agent": "Mozilla/5.0" } });
+  if (!res.ok) throw new Error(`HTTP ${res.status}`);
+  const len = Number(res.headers.get("content-length") || 0);
+  if (len && len > maxBytes) throw new Error(`file troppo grande (${(len / 1048576).toFixed(0)} MB)`);
+  const tmp = dest + ".part";
+  await pipeline(Readable.fromWeb(res.body), fs.createWriteStream(tmp));
+  fs.renameSync(tmp, dest);
+}
+// END-DL
+
+// --- Playlist dagli allegati del canale ---
+let playlist = []; // { id, msgId, name, url, file }
+let mediaIndex = 0;
+let currentFile = null;
+
+function itemsFromMessage(msg) {
+  const out = [];
+  for (const att of msg.attachments?.values?.() ?? []) {
+    if (!isVideo(att)) continue;
+    const ext = (path.extname(att.name || "") || ".mp4").toLowerCase();
+    out.push({
+      id: att.id,
+      msgId: msg.id,
+      name: att.name,
+      url: att.url,
+      file: path.join(MEDIA_DIR, `${att.id}${ext}`),
+    });
+  }
+  return out;
+}
+
+function trimPlaylist() {
+  while (playlist.length > MEDIA_LIMIT) {
+    const old = playlist.shift();
+    if (old.file !== currentFile) fs.rm(old.file, { force: true }, () => {});
+  }
+}
+
+async function loadPlaylist() {
+  if (!MEDIA_CHANNEL_ID) return;
+  const ch = await client.channels.fetch(MEDIA_CHANNEL_ID);
+  if (!ch?.messages) throw new Error("MEDIA_CHANNEL_ID non è un canale testuale leggibile");
+  const msgs = [...(await ch.messages.fetch({ limit: 100 })).values()].sort(
+    (a, b) => a.createdTimestamp - b.createdTimestamp
+  );
+  playlist = msgs.flatMap(itemsFromMessage);
+  trimPlaylist();
+  console.log(`Playlist: ${playlist.length} video dal canale → ${playlist.map((p) => p.name).join(", ") || "(nessuno)"}`);
+}
+
+async function ensureFile(item) {
+  if (fs.existsSync(item.file) && fs.statSync(item.file).size > 0) return item.file;
+  const maxBytes = MAX_MEDIA_MB * 1048576;
+  console.log(`Scarico ${item.name}...`);
+  try {
+    await downloadTo(item.url, item.file, maxBytes);
+  } catch (e) {
+    // link scaduto: rileggo il messaggio per averne uno fresco
+    console.warn(`Download fallito (${e.message}), provo con un link aggiornato`);
+    const ch = await client.channels.fetch(MEDIA_CHANNEL_ID);
+    const msg = await ch.messages.fetch(item.msgId);
+    const fresh = itemsFromMessage(msg).find((x) => x.id === item.id);
+    if (!fresh) throw new Error("allegato non più disponibile");
+    item.url = fresh.url;
+    await downloadTo(item.url, item.file, maxBytes);
+  }
+  console.log(`Scaricato ${item.name} (${(fs.statSync(item.file).size / 1048576).toFixed(1)} MB)`);
+  return item.file;
+}
+
+let fallbackIndex = 0;
+async function nextSource() {
+  if (playlist.length > 0) {
+    const item = playlist[mediaIndex++ % playlist.length];
+    try {
+      const file = await ensureFile(item);
+      currentFile = file;
+      return { src: file, label: item.name };
+    } catch (e) {
+      console.error(`Salto ${item.name}: ${e.message}`);
+      playlist = playlist.filter((p) => p !== item);
+      throw e;
+    }
+  }
+  if (VIDEOS.length > 0) {
+    const src = VIDEOS[fallbackIndex++ % VIDEOS.length];
+    return { src, label: src };
+  }
+  return null;
+}
+
+client.on("messageCreate", (msg) => {
+  if (!MEDIA_CHANNEL_ID || msg.channelId !== MEDIA_CHANNEL_ID) return;
+  const items = itemsFromMessage(msg);
+  if (items.length === 0) return;
+  playlist.push(...items);
+  trimPlaylist();
+  console.log(`Nuovo video nel canale: ${items.map((i) => i.name).join(", ")} (playlist: ${playlist.length})`);
+});
+client.on("messageDelete", (msg) => {
+  if (!MEDIA_CHANNEL_ID || msg.channelId !== MEDIA_CHANNEL_ID) return;
+  const gone = playlist.filter((p) => p.msgId === msg.id);
+  if (gone.length === 0) return;
+  playlist = playlist.filter((p) => p.msgId !== msg.id);
+  console.log(`Video rimosso dal canale: ${gone.map((g) => g.name).join(", ")}`);
+});
 
 // --- Controllo preliminare della sorgente video (diagnostica) ---
 const checked = new Set();
@@ -162,9 +289,9 @@ function scheduleStatus() {
 }
 
 // --- Un turno: entra, trasmette i video in loop fino a fine turno, esce ---
-let videoIndex = 0;
 async function runSession(end) {
   let failures = 0;
+  let emptyLogged = false;
   try {
     for (let a = 1; ; a++) {
       try {
@@ -174,7 +301,6 @@ async function runSession(end) {
       } catch (e) {
         console.error(`Join VC fallito (tentativo ${a}):`, e?.message || e);
         if (/timeout/i.test(e?.message || "")) {
-          // Il gateway ci mette già nel canale: provo comunque ad avviare la cam
           console.warn("joinVoice non risolto ma l'account è nel canale: provo comunque a trasmettere");
           break;
         }
@@ -187,14 +313,23 @@ async function runSession(end) {
     while (!stopping && Date.now() < end - 5000) {
       let killer;
       try {
-        preflight(VIDEOS[videoIndex % VIDEOS.length]);
-        const { command, output } = prepareStream(VIDEOS[videoIndex % VIDEOS.length], {
+        const next = await nextSource();
+        if (!next) {
+          if (!emptyLogged) console.log("Nessun video disponibile (canale vuoto?), aspetto...");
+          emptyLogged = true;
+          await sleep(30_000);
+          continue;
+        }
+        emptyLogged = false;
+        console.log(`Avvio video: ${next.label}`);
+        preflight(next.src);
+
+        const { command, output } = prepareStream(next.src, {
           width: 1280, height: 720, frameRate: 30,
           bitrateVideo: 2500, bitrateVideoMax: 3000,
           bitrateKbps: 2500, maxBitrateKbps: 3000,
           videoCodec: "H264", includeAudio: false,
         });
-        console.log(`Avvio video #${videoIndex % VIDEOS.length}: ${VIDEOS[videoIndex % VIDEOS.length]}`);
         command.on("start", (cmd) => console.log("ffmpeg avviato:", cmd.slice(0, 300)));
         command.on("stderr", (line) => {
           if (/error|fail|invalid|denied|not found|No such|403|404|Server returned/i.test(line)) {
@@ -202,16 +337,14 @@ async function runSession(end) {
           }
         });
         command.on("error", (err) => console.error("ffmpeg:", err?.message));
-        // taglia lo stream esattamente a fine turno
         killer = setTimeout(() => { try { command.kill("SIGKILL"); } catch {} }, Math.max(0, end - Date.now()));
 
         console.log("playStream in corso...");
         await playStream(output, streamer, { type: "camera" }); // o "go-live"
         console.log("playStream terminato");
-        videoIndex++;
         failures = 0;
       } catch (err) {
-        if (Date.now() >= end - 5000) break; // errore dovuto al taglio di fine turno
+        if (Date.now() >= end - 5000) break;
         failures++;
         console.error(`Errore stream (#${failures}):`, err?.message || err);
         if (failures >= 8) {
@@ -239,7 +372,7 @@ async function scheduler() {
   if (START_ON_DEPLOY) {
     const end = Date.now() + SESSION_MINUTES * MIN;
     console.log("Avvio: entro subito e inizio il turno");
-    mustStartAfter = end; // i turni programmati già iniziati vengono saltati
+    mustStartAfter = end;
     await runSession(end);
   }
 
@@ -279,8 +412,13 @@ client.on("voiceStateUpdate", (oldS, newS) => {
   );
 });
 
-client.on("ready", () => {
+client.on("ready", async () => {
   console.log(`Loggato come ${client.user.tag}`);
+  try {
+    await loadPlaylist();
+  } catch (e) {
+    console.error("Playlist non caricata:", e?.message || e, "→ controlla MEDIA_CHANNEL_ID e che l'account veda il canale");
+  }
   scheduleStatus();
   scheduler();
 });
