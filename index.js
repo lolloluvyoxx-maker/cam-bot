@@ -141,6 +141,11 @@ async function runSession(end) {
         break;
       } catch (e) {
         console.error(`Join VC fallito (tentativo ${a}):`, e?.message || e);
+        if (/timeout/i.test(e?.message || "")) {
+          // Il gateway ci mette già nel canale: provo comunque ad avviare la cam
+          console.warn("joinVoice non risolto ma l'account è nel canale: provo comunque a trasmettere");
+          break;
+        }
         if (a >= 4) throw e;
         await sleep(5000 * a + jitter(0, 3000));
       }
