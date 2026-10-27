@@ -1,6 +1,8 @@
 import ffmpegPath from "ffmpeg-static";
 process.env.FFMPEG_PATH = ffmpegPath;
 
+import fs from "node:fs";
+import { spawnSync } from "node:child_process";
 import { Client } from "discord.js-selfbot-v13";
 import { Streamer, prepareStream, playStream } from "@dank074/discord-video-stream";
 
@@ -109,6 +111,36 @@ function nextSession(now, mustStartAfter = 0) {
 
 const fmt = (ts) => new Date(ts).toLocaleString("it-IT", { timeZone: TIMEZONE });
 
+// --- Controllo preliminare della sorgente video (diagnostica) ---
+const checked = new Set();
+function preflight(src) {
+  if (checked.has(src)) return;
+  checked.add(src);
+  try {
+    if (checked.size === 1) {
+      const v = spawnSync(ffmpegPath, ["-version"], { encoding: "utf8", timeout: 10000 });
+      console.log("[check] ffmpeg path:", ffmpegPath, "|", (v.stdout || "").split("\n")[0] || String(v.error || v.stderr));
+    }
+    if (!/^https?:\/\//i.test(src)) {
+      if (!fs.existsSync(src)) {
+        console.error(`[check] file NON trovato: ${src} | cwd=${process.cwd()} | file qui: ${fs.readdirSync(".").join(", ")}`);
+        return;
+      }
+      const st = fs.statSync(src);
+      const fd = fs.openSync(src, "r");
+      const buf = Buffer.alloc(16);
+      fs.readSync(fd, buf, 0, 16, 0);
+      fs.closeSync(fd);
+      console.log(`[check] ${src}: ${(st.size / 1048576).toFixed(2)} MB | header hex=${buf.toString("hex")} | testo=${JSON.stringify(buf.toString("latin1"))}`);
+    }
+    const r = spawnSync(ffmpegPath, ["-hide_banner", "-i", src], { encoding: "utf8", timeout: 20000 });
+    const out = ((r.stderr || "") + (r.stdout || "")).split("\n").filter(Boolean).slice(0, 14).join(" | ");
+    console.log("[check] ffmpeg legge:", out.slice(0, 900), r.error ? String(r.error) : "");
+  } catch (e) {
+    console.error("[check] errore:", e?.message);
+  }
+}
+
 // --- Status rotator ---
 let statusIndex = 0;
 function rotateStatus() {
@@ -155,8 +187,10 @@ async function runSession(end) {
     while (!stopping && Date.now() < end - 5000) {
       let killer;
       try {
+        preflight(VIDEOS[videoIndex % VIDEOS.length]);
         const { command, output } = prepareStream(VIDEOS[videoIndex % VIDEOS.length], {
           width: 1280, height: 720, frameRate: 30,
+          bitrateVideo: 2500, bitrateVideoMax: 3000,
           bitrateKbps: 2500, maxBitrateKbps: 3000,
           videoCodec: "H264", includeAudio: false,
         });
