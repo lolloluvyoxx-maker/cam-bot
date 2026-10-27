@@ -39,6 +39,11 @@ const client = new Client();
 const streamer = new Streamer(client);
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 const jitter = (min, max) => Math.floor(min + Math.random() * (max - min));
+const withTimeout = (p, ms, label) =>
+  Promise.race([
+    p,
+    new Promise((_, rej) => setTimeout(() => rej(new Error(`${label}: timeout dopo ${ms / 1000}s`)), ms)),
+  ]);
 
 let stopping = false;
 
@@ -131,7 +136,8 @@ async function runSession(end) {
   try {
     for (let a = 1; ; a++) {
       try {
-        await streamer.joinVoice(GUILD_ID, CHANNEL_ID);
+        console.log(`joinVoice (tentativo ${a}) guild=${GUILD_ID} channel=${CHANNEL_ID}`);
+        await withTimeout(streamer.joinVoice(GUILD_ID, CHANNEL_ID), 30_000, "joinVoice");
         break;
       } catch (e) {
         console.error(`Join VC fallito (tentativo ${a}):`, e?.message || e);
@@ -149,11 +155,20 @@ async function runSession(end) {
           bitrateKbps: 2500, maxBitrateKbps: 3000,
           videoCodec: "H264", includeAudio: false,
         });
+        console.log(`Avvio video #${videoIndex % VIDEOS.length}: ${VIDEOS[videoIndex % VIDEOS.length]}`);
+        command.on("start", (cmd) => console.log("ffmpeg avviato:", cmd.slice(0, 300)));
+        command.on("stderr", (line) => {
+          if (/error|fail|invalid|denied|not found|No such|403|404|Server returned/i.test(line)) {
+            console.error("ffmpeg stderr:", line);
+          }
+        });
         command.on("error", (err) => console.error("ffmpeg:", err?.message));
         // taglia lo stream esattamente a fine turno
         killer = setTimeout(() => { try { command.kill("SIGKILL"); } catch {} }, Math.max(0, end - Date.now()));
 
+        console.log("playStream in corso...");
         await playStream(output, streamer, { type: "camera" }); // o "go-live"
+        console.log("playStream terminato");
         videoIndex++;
         failures = 0;
       } catch (err) {
@@ -217,6 +232,13 @@ function shutdown() {
 process.on("SIGTERM", shutdown);
 process.on("SIGINT", shutdown);
 process.on("unhandledRejection", (e) => console.error("Unhandled:", e));
+
+client.on("voiceStateUpdate", (oldS, newS) => {
+  if (newS.id !== client.user?.id) return;
+  console.log(
+    `[voice] canale=${newS.channelId} selfDeaf=${newS.selfDeaf} selfMute=${newS.selfMute} selfVideo=${newS.selfVideo} streaming=${newS.streaming}`
+  );
+});
 
 client.on("ready", () => {
   console.log(`Loggato come ${client.user.tag}`);
