@@ -8,7 +8,8 @@ import os from "node:os";
 import path from "node:path";
 import { Readable } from "node:stream";
 import { pipeline } from "node:stream/promises";
-import { spawnSync } from "node:child_process";
+import { spawnSync, execFile } from "node:child_process";
+import { promisify } from "node:util";
 import dgram from "node:dgram";
 import { Client } from "@lng2004/discord.js-selfbot-v13";
 import { Streamer, prepareStream, playStream, Utils, Encoders } from "@dank074/discord-video-stream";
@@ -177,7 +178,10 @@ function itemsFromMessage(msg) {
 function trimPlaylist() {
   while (playlist.length > MEDIA_LIMIT) {
     const old = playlist.shift();
-    if (old.file !== currentFile) fs.rm(old.file, { force: true }, () => {});
+    if (old.file !== currentFile) {
+      fs.rm(old.file, { force: true }, () => {});
+      fs.rm(old.file.replace(/\.[^./\\]+$/, "") + ".noaudio.mp4", { force: true }, () => {});
+    }
   }
 }
 
@@ -193,7 +197,7 @@ async function loadPlaylist() {
   console.log(`Playlist: ${playlist.length} video dal canale → ${playlist.map((p) => p.name).join(", ") || "(nessuno)"}`);
 }
 
-async function ensureFile(item) {
+async function ensureDownloaded(item) {
   if (fs.existsSync(item.file) && fs.statSync(item.file).size > 0) return item.file;
   const maxBytes = MAX_MEDIA_MB * 1048576;
   console.log(`Scarico ${item.name}...`);
@@ -213,13 +217,36 @@ async function ensureFile(item) {
   return item.file;
 }
 
+// La libreria aggiunge al comando ffmpeg un filtro audio (azmq) che l'ffmpeg incluso
+// non ha: se il file non ha audio, quel filtro non viene mai usato.
+const execFileP = promisify(execFile);
+async function stripAudio(src) {
+  const out = src.replace(/\.[^./\\]+$/, "") + ".noaudio.mp4";
+  if (fs.existsSync(out) && fs.statSync(out).size > 0) return out;
+  const run = (args, timeout) => execFileP(ffmpegPath, args, { timeout, maxBuffer: 20 * 1024 * 1024 });
+  try {
+    await run(["-y", "-i", src, "-an", "-c:v", "copy", "-movflags", "+faststart", out], 120_000);
+  } catch (e) {
+    console.warn("Copia senza audio fallita, ricodifico il video:", String(e?.stderr || e?.message || e).split("\n").slice(-3).join(" | "));
+    fs.rmSync(out, { force: true });
+    await run(["-y", "-i", src, "-an", "-c:v", "libx264", "-preset", "veryfast", "-pix_fmt", "yuv420p", "-movflags", "+faststart", out], 600_000);
+  }
+  console.log(`Video senza audio pronto: ${path.basename(out)} (${(fs.statSync(out).size / 1048576).toFixed(1)} MB)`);
+  return out;
+}
+
+async function ensureFile(item) {
+  const raw = await ensureDownloaded(item);
+  return stripAudio(raw);
+}
+
 let fallbackIndex = 0;
 async function nextSource() {
   if (playlist.length > 0) {
     const item = playlist[mediaIndex++ % playlist.length];
     try {
       const file = await ensureFile(item);
-      currentFile = file;
+      currentFile = item.file;
       return { src: file, label: item.name };
     } catch (e) {
       console.error(`Salto ${item.name}: ${e.message}`);
