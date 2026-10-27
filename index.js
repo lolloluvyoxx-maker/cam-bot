@@ -1,5 +1,7 @@
 import ffmpegPath from "ffmpeg-static";
 process.env.FFMPEG_PATH = ffmpegPath;
+// la libreria cerca ffmpeg nel PATH
+process.env.PATH = `${ffmpegPath.replace(/[\\/][^\\/]*$/, "")}:${process.env.PATH}`;
 
 import fs from "node:fs";
 import os from "node:os";
@@ -8,8 +10,8 @@ import { Readable } from "node:stream";
 import { pipeline } from "node:stream/promises";
 import { spawnSync } from "node:child_process";
 import dgram from "node:dgram";
-import { Client } from "discord.js-selfbot-v13";
-import { Streamer, prepareStream, playStream } from "@dank074/discord-video-stream";
+import { Client } from "@lng2004/discord.js-selfbot-v13";
+import { Streamer, prepareStream, playStream, Utils, Encoders } from "@dank074/discord-video-stream";
 
 // --- Config (variabili Railway) ---
 const TOKEN = process.env.TOKEN;
@@ -26,7 +28,7 @@ const VIDEOS = (process.env.VIDEOS || "").split(",").map((v) => v.trim()).filter
 // Impostazioni stream (modificabili senza toccare il codice)
 const JOIN_TIMEOUT_SEC = Number(process.env.JOIN_TIMEOUT_SEC || 45);
 const STREAM_TYPE = (process.env.STREAM_TYPE || "camera").toLowerCase(); // camera | go-live
-const VIDEO_CODEC = (process.env.VIDEO_CODEC || "H264").toUpperCase(); // H264 | VP8
+const VIDEO_CODEC = (process.env.VIDEO_CODEC || "H264").toUpperCase(); // H264 | H265
 const STREAM_WIDTH = Number(process.env.STREAM_WIDTH || 1280);
 const STREAM_HEIGHT = Number(process.env.STREAM_HEIGHT || 720);
 const STREAM_FPS = Number(process.env.STREAM_FPS || 30);
@@ -357,7 +359,6 @@ async function runSession(end) {
     console.log(`Entrato nel VC, resto fino alle ${fmt(end)}`);
 
     while (!stopping && Date.now() < end - 5000) {
-      let killer;
       try {
         const next = await nextSource();
         if (!next) {
@@ -370,23 +371,34 @@ async function runSession(end) {
         console.log(`Avvio video: ${next.label}`);
         preflight(next.src);
 
-        const { command, output } = prepareStream(next.src, {
-          width: STREAM_WIDTH, height: STREAM_HEIGHT, frameRate: STREAM_FPS,
-          bitrateVideo: STREAM_BITRATE, bitrateVideoMax: Math.round(STREAM_BITRATE * 1.2),
-          bitrateKbps: STREAM_BITRATE, maxBitrateKbps: Math.round(STREAM_BITRATE * 1.2),
-          videoCodec: VIDEO_CODEC, includeAudio: false,
+        const encoder = Encoders.software({
+          x264: { preset: "superfast" },
+          x265: { preset: "superfast" },
         });
-        command.on("start", (cmd) => console.log("ffmpeg avviato:", cmd.slice(0, 300)));
-        command.on("stderr", (line) => {
-          if (/error|fail|invalid|denied|not found|No such|403|404|Server returned/i.test(line)) {
-            console.error("ffmpeg stderr:", line);
-          }
+        const { output, promise } = await prepareStream(next.src, {
+          encoder,
+          height: STREAM_HEIGHT, // solo altezza: mantiene le proporzioni
+          frameRate: STREAM_FPS,
+          fps: STREAM_FPS,
+          bitrateVideo: STREAM_BITRATE,
+          bitrateVideoMax: Math.round(STREAM_BITRATE * 1.5),
+          videoCodec: Utils.normalizeVideoCodec(VIDEO_CODEC),
+          audioStream: () => null, // solo video
         });
-        command.on("error", (err) => console.error("ffmpeg:", err?.message));
-        killer = setTimeout(() => { try { command.kill("SIGKILL"); } catch {} }, Math.max(0, end - Date.now()));
+        promise?.catch?.((e) => console.error("transcode:", e?.message || e));
 
-        console.log(`playStream in corso... tipo=${STREAM_TYPE} codec=${VIDEO_CODEC} ${STREAM_WIDTH}x${STREAM_HEIGHT}@${STREAM_FPS} ${STREAM_BITRATE}kbps`);
-        await playStream(output, streamer, { type: STREAM_TYPE });
+        console.log(`playStream in corso... tipo=${STREAM_TYPE} codec=${VIDEO_CODEC} h=${STREAM_HEIGHT}@${STREAM_FPS} ${STREAM_BITRATE}kbps`);
+        const played = playStream(output, streamer, { type: STREAM_TYPE });
+        played.catch(() => {});
+        // taglia lo stream esattamente a fine turno
+        let cutTimer;
+        const cut = new Promise((r) => { cutTimer = setTimeout(() => r("cut"), Math.max(0, end - Date.now())); });
+        const res = await Promise.race([played, cut]);
+        clearTimeout(cutTimer);
+        if (res === "cut") {
+          try { output.destroy(); } catch {}
+          break;
+        }
         console.log("playStream terminato");
         failures = 0;
       } catch (err) {
@@ -403,8 +415,6 @@ async function runSession(end) {
           try { await joinVC(); } catch (e) { console.error("Rientro fallito:", e?.message || e); }
         }
         await sleep(Math.min(10_000 * 2 ** (failures - 1), 300_000) + jitter(0, 5000));
-      } finally {
-        clearTimeout(killer);
       }
       await sleep(jitter(1000, 3000));
     }
